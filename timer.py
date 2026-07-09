@@ -139,10 +139,12 @@ CLEAR_TO_END = "\x1b[J"
 REVERSE_VIDEO_ON = "\x1b[?5h"
 REVERSE_VIDEO_OFF = "\x1b[?5l"
 RESET_ATTRS = "\x1b[0m"
+ENTER_ALT_SCREEN = "\x1b[?1049h"
+EXIT_ALT_SCREEN = "\x1b[?1049l"
 BELL = "\a"
 
 
-def draw(time_str: str, footer: str = None) -> None:
+def draw(time_str: str, footer: str = None, full_clear: bool = False) -> None:
     cols, rows = shutil.get_terminal_size(fallback=(80, 24))
     lines = render_lines(time_str)
     width = max(len(line) for line in lines)
@@ -159,14 +161,37 @@ def draw(time_str: str, footer: str = None) -> None:
     frame_lines = [""] * top_pad + [" " * left_pad + line for line in lines]
     frame = "\n".join(frame_lines)
 
-    sys.stdout.write(CURSOR_HOME + frame + CLEAR_TO_END)
+    # A resize can shift where the block lands (or shrink/grow the terminal
+    # itself), so a plain "clear to end of screen" after the cursor's final
+    # position can leave stale characters from the previous layout sitting
+    # above/beside the new one. Do a full clear in that case instead of the
+    # normal cheap redraw.
+    prefix = CLEAR_SCREEN + CURSOR_HOME if full_clear else CURSOR_HOME
+    sys.stdout.write(prefix + frame + CLEAR_TO_END)
     sys.stdout.flush()
 
 
 def restore_and_exit(signum=None, frame=None) -> None:
-    sys.stdout.write(REVERSE_VIDEO_OFF + SHOW_CURSOR + RESET_ATTRS + CLEAR_SCREEN + CURSOR_HOME)
+    sys.stdout.write(
+        REVERSE_VIDEO_OFF
+        + SHOW_CURSOR
+        + RESET_ATTRS
+        + CLEAR_SCREEN
+        + CURSOR_HOME
+        + EXIT_ALT_SCREEN
+    )
     sys.stdout.flush()
     sys.exit(0)
+
+
+# Set by _on_resize (SIGWINCH) so the running loops know to re-center on the
+# next redraw, however far along the countdown/alarm they currently are.
+_resized = False
+
+
+def _on_resize(signum=None, frame=None) -> None:
+    global _resized
+    _resized = True
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +200,7 @@ def restore_and_exit(signum=None, frame=None) -> None:
 
 
 def run_countdown(total_seconds: int) -> None:
+    global _resized
     deadline = time.monotonic() + total_seconds
     last_shown = None
 
@@ -183,18 +209,33 @@ def run_countdown(total_seconds: int) -> None:
         if remaining <= 0:
             break
         secs_to_show = math.ceil(remaining)
-        if secs_to_show != last_shown:
-            draw(format_time(secs_to_show), footer="(Ctrl+C to quit)")
+        if secs_to_show != last_shown or _resized:
+            draw(format_time(secs_to_show), full_clear=_resized)
             last_shown = secs_to_show
+            _resized = False
         time.sleep(0.05)
 
 
 def run_alarm() -> None:
-    draw(format_time(0), footer="TIME'S UP!  (Ctrl+C to quit)")
+    global _resized
+
+    def redraw(full_clear=False):
+        draw(format_time(0), footer="TIME'S UP!", full_clear=full_clear)
+
+    redraw()
+    _resized = False
+
     while True:
+        if _resized:
+            redraw(full_clear=True)
+            _resized = False
         sys.stdout.write(REVERSE_VIDEO_ON + BELL)
         sys.stdout.flush()
         time.sleep(0.4)
+
+        if _resized:
+            redraw(full_clear=True)
+            _resized = False
         sys.stdout.write(REVERSE_VIDEO_OFF)
         sys.stdout.flush()
         time.sleep(0.4)
@@ -218,8 +259,10 @@ def main() -> None:
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, restore_and_exit)
+    if hasattr(signal, "SIGWINCH"):
+        signal.signal(signal.SIGWINCH, _on_resize)
 
-    sys.stdout.write(HIDE_CURSOR + CLEAR_SCREEN)
+    sys.stdout.write(ENTER_ALT_SCREEN + HIDE_CURSOR + CLEAR_SCREEN)
     sys.stdout.flush()
 
     run_countdown(args.duration)
